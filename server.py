@@ -10,14 +10,18 @@ A rede a varrer é digitada na própria tela (ex.: 192.168.2.0/24).
 
 Depois abra http://localhost:8000
 
+Aba MikroTik: monitora portas (ether1, ether2, ether5...) por SNMP v2c; configure IP e community na própria aba.
+
 Opcional: com o nmap instalado (sudo apt install nmap) a varredura também mostra MAC, fabricante e
 portas abertas (22, 80, 443...). Sem o nmap ela continua funcionando só com ping + tabela ARP.
 """
+import collections
 import gzip
 import ipaddress
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import socket
@@ -33,6 +37,13 @@ from html import escape as _attr
 
 # ============================== CONFIGURAÇÃO ================================
 DEFAULT_SCAN_NETWORK = "192.168.2.0/24"   # só vem preenchida na tela; você pode digitar qualquer outra
+# --- MikroTik via SNMP (aba "MikroTik"): estes valores são os iniciais; a tela grava as alterações no banco ---
+MIKROTIK_HOST = ""                   # IP do roteador, ex.: "192.168.88.1" (vazio = configure pela tela)
+MIKROTIK_COMMUNITY = "public"        # community SNMP v2c (somente leitura)
+MIKROTIK_PORTS = ["ether1", "ether2", "ether5"]   # interfaces monitoradas
+SNMP_INTERVAL = 10                   # segundos entre leituras
+SNMP_TIMEOUT = 2                     # segundos de espera por resposta
+SNMP_RETRIES = 1                     # novas tentativas antes de considerar sem resposta
 LOGO_URL = "https://cdn-icons-png.magnific.com/256/17794/17794572.png"                        # link da imagem do logo ao lado do título, ex.: "https://site.com/logo.png"
 BIND = "0.0.0.0"                     # use "127.0.0.1" para acesso só neste computador
 PORT = 8000
@@ -45,9 +56,10 @@ PING_TIMEOUT = 2                     # segundos de espera por resposta
 FAILS_TO_OFFLINE = 3                 # falhas seguidas para declarar offline
 RETRY_INTERVAL = 2                   # quando um ping falha, tenta de novo após N segundos (confirmação rápida)
 MONITOR_WORKERS = 64                 # pings simultâneos no monitoramento (aumente se tiver muitos dispositivos)
+VERIFY_MAC = True                    # Linux, rede local: confirma que quem responde é o MESMO equipamento (MAC)
 RECOVER_CONFIRMATIONS = 2            # respostas seguidas exigidas para sair de "offline" (evita falso retorno)
 MAX_SCAN_HOSTS = 4096                # trava de segurança
-SCAN_PORTS = [22, 80, 443, 3389, 23, 8080, 8443, 21]           # portas TCP verificadas na varredura (exige nmap); acrescente 554, 3389...
+SCAN_PORTS = [21, 22, 23, 80, 443, 8080, 8443, 3389]           # portas TCP verificadas na varredura (exige nmap); acrescente 554, 3389...
 NMAP_TIMEOUT = 180                   # segundos máximos por bloco de hosts no nmap
 PORT_NAMES = {21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS", 80: "HTTP", 81: "HTTP", 110: "POP3",
               139: "NetBIOS", 161: "SNMP", 443: "HTTPS", 445: "SMB", 554: "RTSP", 993: "IMAPS", 1433: "SQL Server",
@@ -94,11 +106,22 @@ CREATE TABLE IF NOT EXISTS devices (
   fails INTEGER NOT NULL DEFAULT 0, first_fail INTEGER,
   created INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS port_events (           -- quedas de porta do MikroTik
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  iface TEXT NOT NULL,
+  started INTEGER NOT NULL,                 -- link caiu (horário do próprio roteador)
+  ended INTEGER,                            -- link voltou (NULL = ainda down)
+  reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_port_events ON port_events(iface, started);
 CREATE TABLE IF NOT EXISTS outages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
   started INTEGER NOT NULL,                 -- ficou offline
-  ended INTEGER                             -- voltou (NULL = ainda offline)
+  ended INTEGER,                            -- voltou (NULL = ainda offline)
+  start_reason TEXT NOT NULL DEFAULT '',    -- o que o ping mostrou quando caiu
+  end_reason TEXT NOT NULL DEFAULT ''       -- a resposta que confirmou o retorno
 );
 """)
 # Bancos criados por versões anteriores ainda não têm algumas colunas
@@ -107,6 +130,10 @@ if "category" not in _cols:
     _db.execute("ALTER TABLE devices ADD COLUMN category TEXT NOT NULL DEFAULT 'Outros'")
 if "detail" not in _cols:
     _db.execute("ALTER TABLE devices ADD COLUMN detail TEXT NOT NULL DEFAULT ''")
+_ocols = {r["name"] for r in _db.execute("PRAGMA table_info(outages)")}
+for _col in ("start_reason", "end_reason"):
+    if _col not in _ocols:
+        _db.execute("ALTER TABLE outages ADD COLUMN %s TEXT NOT NULL DEFAULT ''" % _col)
 for _col in ("mac", "vendor"):
     if _col not in _cols:
         _db.execute("ALTER TABLE devices ADD COLUMN %s TEXT NOT NULL DEFAULT ''" % _col)
@@ -219,6 +246,13 @@ def delete_category(name):
     return moved
 
 
+def parse_mac_input(value):
+    v = (value or "").strip().lower().replace("-", ":")
+    if v and not _MAC_RE.match(v):
+        raise ValueError("MAC inválido. Use o formato aa:bb:cc:dd:ee:ff.")
+    return v
+
+
 def clean_device_name(value, host):
     """Nome do dispositivo: vazio volta a ser o próprio endereço."""
     v = re.sub(r"\s+", " ", (value or "").strip())
@@ -305,8 +339,8 @@ def apply_result(dev_id, ok, latency, detail=""):
         d, t, detail = rows[0], int(time.time()), (detail or "")[:200]
         if ok:
             if d["status"] == "offline":  # VOLTOU
-                x("UPDATE outages SET ended=? WHERE device_id=? AND ended IS NULL", (t, dev_id))
-                log.info("ONLINE  %s (%s) voltou", d["name"], d["host"])
+                x("UPDATE outages SET ended=?, end_reason=? WHERE device_id=? AND ended IS NULL", (t, detail, dev_id))
+                log.info("ONLINE  %s (%s) voltou: %s", d["name"], d["host"], detail)
             since = d["since"] if d["status"] == "online" else t
             x("""UPDATE devices SET status='online', since=?, last_check=?, latency=?, detail=?,
                  fails=0, first_fail=NULL WHERE id=?""", (since, t, latency, detail, dev_id))
@@ -316,10 +350,46 @@ def apply_result(dev_id, ok, latency, detail=""):
         if status != "offline" and fails >= FAILS_TO_OFFLINE:  # CAIU (queda começa na 1ª falha)
             status, since = "offline", first
             if not q("SELECT id FROM outages WHERE device_id=? AND ended IS NULL", (dev_id,)):
-                x("INSERT INTO outages (device_id, started) VALUES (?,?)", (dev_id, first))
+                x("INSERT INTO outages (device_id, started, start_reason) VALUES (?,?,?)", (dev_id, first, detail))
             log.warning("OFFLINE %s (%s) caiu: %s", d["name"], d["host"], detail)
         x("""UPDATE devices SET status=?, since=?, last_check=?, latency=NULL, detail=?,
              fails=?, first_fail=? WHERE id=?""", (status, since, t, detail, fails, first, dev_id))
+
+
+def arp_mac(ip):
+    """MAC do IP na tabela ARP do Linux (só existe para equipamentos da mesma rede local)."""
+    try:
+        with open("/proc/net/arp") as f:
+            next(f, None)
+            for line in f:
+                c = line.split()
+                if len(c) >= 4 and c[0] == ip and c[2] != "0x0":
+                    m = c[3].lower()
+                    return m if _MAC_RE.match(m) and m != "00:00:00:00:00:00" else ""
+    except OSError:
+        pass
+    return ""
+
+
+def _probe(dev_id, host):
+    """1 ping + confirmação de que quem respondeu é o equipamento cadastrado.
+    Retorna (respondeu, latência, detalhe, mac_visto)."""
+    ok, lat, detail = ping(host)
+    seen = ""
+    if ok and VERIFY_MAC:
+        seen = arp_mac((_IPV4.findall(detail) or [host])[0])
+        row = q("SELECT mac FROM devices WHERE id=?", (dev_id,))
+        known = row[0]["mac"] if row else ""
+        if seen and known and seen != known:  # outro aparelho está com esse IP (DHCP) ou respondendo por ele
+            return False, None, "Resposta de outro equipamento: MAC %s, esperado %s (ignorada)" % (seen, known), seen
+        if seen:
+            detail = "%s  [MAC %s]" % (detail, seen)
+    return ok, lat, detail, seen
+
+
+def _learn_mac(dev_id, seen):
+    if seen:  # primeira vez que o equipamento responde na rede local: guarda o MAC para as próximas conferências
+        x("UPDATE devices SET mac=?, vendor=? WHERE id=? AND mac=''", (seen, mac_vendor(seen), dev_id))
 
 
 def check(dev_id, retry=True):
@@ -330,17 +400,19 @@ def check(dev_id, retry=True):
     if not rows:
         return
     host, status = rows[0]["host"], rows[0]["status"]
-    ok, lat, detail = ping(host)
+    ok, lat, detail, seen = _probe(dev_id, host)
 
     if ok and status == "offline":
         for _ in range(RECOVER_CONFIRMATIONS - 1):
             time.sleep(RETRY_INTERVAL)
-            ok2, lat2, detail2 = ping(host)
+            ok2, lat2, detail2, seen2 = _probe(dev_id, host)
             if not ok2:
                 ok, lat, detail = False, None, "Retorno não confirmado: " + detail2
                 break
-            lat, detail = lat2, detail2
+            lat, detail, seen = lat2, detail2, seen2 or seen
     apply_result(dev_id, ok, lat, detail)
+    if ok:
+        _learn_mac(dev_id, seen)
 
     attempts = 1
     while not ok and retry and attempts < FAILS_TO_OFFLINE:
@@ -348,8 +420,10 @@ def check(dev_id, retry=True):
         if not st or st[0]["status"] == "offline":  # removido ou já confirmado offline: não insiste
             return
         time.sleep(RETRY_INTERVAL)
-        ok, lat, detail = ping(st[0]["host"])
+        ok, lat, detail, seen = _probe(dev_id, st[0]["host"])
         apply_result(dev_id, ok, lat, detail)
+        if ok:
+            _learn_mac(dev_id, seen)
         attempts += 1
 
 
@@ -621,12 +695,385 @@ def start_scan(text, deep=False):
     return True
 
 
+# -------------------------- SNMP: portas do MikroTik --------------------------
+# Cliente SNMPv2c mínimo (só biblioteca padrão): GET e GETBULK sobre UDP. Lê a IF-MIB
+# (estado, velocidade, tráfego e erros das interfaces) e registra quando uma porta cai e volta.
+class SnmpError(Exception):
+    pass
+
+
+_SNMP_ERRORS = {1: "resposta grande demais (tooBig)", 2: "OID inexistente (noSuchName)", 3: "valor inválido (badValue)",
+                4: "somente leitura (readOnly)", 5: "erro genérico no agente (genErr)"}
+_SYS = {"descr": "1.3.6.1.2.1.1.1.0", "uptime": "1.3.6.1.2.1.1.3.0", "name": "1.3.6.1.2.1.1.5.0"}
+_IFX = "1.3.6.1.2.1.31.1.1.1"    # ifXTable (nomes, 64 bits, ifHighSpeed)
+_IFT = "1.3.6.1.2.1.2.2.1"       # ifTable
+_IFOIDS = {"oper": _IFT + ".8", "admin": _IFT + ".7", "last": _IFT + ".9", "speed": _IFT + ".5",
+           "hspeed": _IFX + ".15", "hin": _IFX + ".6", "hout": _IFX + ".10", "in32": _IFT + ".10",
+           "out32": _IFT + ".16", "inerr": _IFT + ".14", "outerr": _IFT + ".20"}
+_OPER_TEXT = {1: "up", 2: "down", 3: "testing", 4: "unknown", 5: "dormant", 6: "notPresent", 7: "lowerLayerDown"}
+
+
+def _ber_len(n):
+    if n < 0x80:
+        return bytes([n])
+    b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(b)]) + b
+
+
+def _tlv(tag, body):
+    return bytes([tag]) + _ber_len(len(body)) + body
+
+
+def _ber_int(v):
+    return _tlv(0x02, v.to_bytes(max(1, (v.bit_length() + 8) // 8), "big", signed=True))
+
+
+def _ber_oid(oid):
+    p = [int(x) for x in oid.strip(".").split(".")]
+    body = bytearray([40 * p[0] + p[1]])
+    for n in p[2:]:
+        chunk = [n & 0x7F]
+        n >>= 7
+        while n:
+            chunk.append(0x80 | (n & 0x7F))
+            n >>= 7
+        body += bytes(reversed(chunk))
+    return _tlv(0x06, bytes(body))
+
+
+def _read(buf, i):
+    """Lê um TLV em buf[i:]. Retorna (tag, conteúdo, próxima posição)."""
+    tag, ln, i = buf[i], buf[i + 1], i + 2
+    if ln & 0x80:
+        k = ln & 0x7F
+        ln, i = int.from_bytes(buf[i:i + k], "big"), i + k
+    if i + ln > len(buf):
+        raise ValueError("mensagem truncada")
+    return tag, buf[i:i + ln], i + ln
+
+
+def _dec_oid(b):
+    subs, v = [], 0
+    for c in b:
+        v = (v << 7) | (c & 0x7F)
+        if not c & 0x80:
+            subs.append(v)
+            v = 0
+    first = subs[0]
+    head = [first // 40, first % 40] if first < 80 else [2, first - 80]
+    return ".".join(str(n) for n in head + subs[1:])
+
+
+def _dec_value(tag, b):
+    if tag == 0x02:
+        return int.from_bytes(b, "big", signed=True)
+    if tag in (0x41, 0x42, 0x43, 0x46):       # Counter32, Gauge32, TimeTicks, Counter64
+        return int.from_bytes(b, "big")
+    if tag == 0x04:
+        return b.decode("utf-8", "replace")
+    if tag == 0x06:
+        return _dec_oid(b)
+    if tag == 0x40:
+        return ".".join(str(x) for x in b)
+    return None                                # NULL, noSuchObject (0x80), noSuchInstance (0x81), endOfMibView (0x82)
+
+
+def snmp_build(kind, reqid, community, oids, non_rep=0, max_rep=10):
+    """Monta a mensagem SNMPv2c. kind: 'get' | 'next' | 'bulk'."""
+    if kind == "bulk":
+        ptag, head = 0xA5, _ber_int(reqid) + _ber_int(non_rep) + _ber_int(max_rep)
+    else:
+        ptag, head = (0xA0 if kind == "get" else 0xA1), _ber_int(reqid) + _ber_int(0) + _ber_int(0)
+    vbs = b"".join(_tlv(0x30, _ber_oid(o) + b"\x05\x00") for o in oids)
+    return _tlv(0x30, _ber_int(1) + _tlv(0x04, community.encode("latin-1")) + _tlv(ptag, head + _tlv(0x30, vbs)))
+
+
+def snmp_parse(data, reqid):
+    """Lê a resposta. Retorna (erro, [(oid, tag, valor)]) ou None se for resposta de outra requisição."""
+    tag, msg, _ = _read(data, 0)
+    if tag != 0x30:
+        raise ValueError("não é SNMP")
+    _, _ver, i = _read(msg, 0)
+    _, _comm, i = _read(msg, i)
+    ptag, pdu, _ = _read(msg, i)
+    if ptag != 0xA2:
+        raise ValueError("não é uma resposta")
+    _, rid, j = _read(pdu, 0)
+    if int.from_bytes(rid, "big", signed=True) != reqid:
+        return None
+    _, es, j = _read(pdu, j)
+    _, _ei, j = _read(pdu, j)
+    _, vbs, _ = _read(pdu, j)
+    out, k = [], 0
+    while k < len(vbs):
+        _, vb, k = _read(vbs, k)
+        _, ob, m = _read(vb, 0)
+        vt, vv, _ = _read(vb, m)
+        out.append((_dec_oid(ob), vt, _dec_value(vt, vv)))
+    return int.from_bytes(es, "big"), out
+
+
+def snmp_query(cfg, kind, oids, non_rep=0, max_rep=10):
+    try:
+        ip = socket.gethostbyname(cfg["host"])
+    except OSError:
+        raise SnmpError("não foi possível resolver %r" % cfg["host"])
+    reqid = random.randrange(1, 2 ** 31)
+    msg = snmp_build(kind, reqid, cfg["community"], oids, non_rep, max_rep)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        for _ in range(SNMP_RETRIES + 1):
+            try:
+                s.sendto(msg, (ip, cfg["port"]))
+            except OSError as e:
+                raise SnmpError("falha ao enviar: %s" % e)
+            end = time.monotonic() + SNMP_TIMEOUT
+            while True:
+                left = end - time.monotonic()
+                if left <= 0:
+                    break
+                s.settimeout(left)
+                try:
+                    data, addr = s.recvfrom(65535)
+                except socket.timeout:
+                    break
+                except OSError as e:
+                    raise SnmpError("falha ao receber: %s" % e)
+                if addr[0] != ip:
+                    continue
+                try:
+                    r = snmp_parse(data, reqid)
+                except (ValueError, IndexError):
+                    continue
+                if r is None:
+                    continue
+                if r[0]:
+                    raise SnmpError("o roteador recusou a consulta: " + _SNMP_ERRORS.get(r[0], "erro %d" % r[0]))
+                return r[1]
+    raise SnmpError("sem resposta SNMP em %s:%d. Confira o IP, a community, se o SNMP está habilitado no "
+                    "roteador e se o firewall libera UDP %d." % (cfg["host"], cfg["port"], cfg["port"]))
+
+
+def snmp_get(cfg, oids):
+    """{oid: valor} (None quando o roteador não tem aquele OID)."""
+    out = {}
+    for i in range(0, len(oids), 25):   # pacotes pequenos cabem em qualquer MTU
+        for oid, _tag, val in snmp_query(cfg, "get", oids[i:i + 25]):
+            out[oid] = val
+    return out
+
+
+def snmp_walk(cfg, base, limit=512):
+    out, cur = [], base
+    while len(out) < limit:
+        progressed = False
+        for oid, tag, val in snmp_query(cfg, "bulk", [cur], max_rep=10):
+            if tag == 0x82 or not oid.startswith(base + "."):
+                return out
+            out.append((oid, val))
+            cur, progressed = oid, True
+        if not progressed:
+            break
+    return out
+
+
+def snmp_ifmap(cfg):
+    """{nome da interface: ifIndex}. No MikroTik ifName é o próprio nome (ether1, ether2...)."""
+    rows = snmp_walk(cfg, _IFX + ".1") or snmp_walk(cfg, _IFT + ".2")
+    return {str(v): int(oid.rsplit(".", 1)[1]) for oid, v in rows if v is not None}
+
+
+# ---- configuração (padrões do topo do arquivo; a tela grava as alterações no banco)
+def get_setting(key, default=""):
+    r = q("SELECT value FROM settings WHERE key=?", (key,))
+    return r[0]["value"] if r else default
+
+
+def set_setting(key, value):
+    x("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+
+def mt_config():
+    cfg = {"host": MIKROTIK_HOST, "community": MIKROTIK_COMMUNITY, "port": 161, "interfaces": list(MIKROTIK_PORTS)}
+    try:
+        saved = json.loads(get_setting("mikrotik", "{}"))
+    except ValueError:
+        saved = {}
+    cfg.update({k: v for k, v in saved.items() if k in cfg})
+    return cfg
+
+
+_mt_lock = threading.Lock()      # dados lidos pela API
+_poll_lock = threading.Lock()    # uma consulta SNMP por vez
+_mt_wake = threading.Event()
+mt = {}
+
+
+def mt_reset():
+    with _mt_lock:
+        mt.update(ok=False, error="", last_poll=None, sysname="", descr="", uptime=None, ifmap={}, ifmap_at=0,
+                  ports={}, prev={}, seen={}, samples={})
+
+
+mt_reset()
+
+
+def mt_save(body):
+    """Valida e grava a configuração; consulta o roteador na hora. Retorna '' ou a mensagem de erro do SNMP."""
+    cur = mt_config()
+    host_in = (body.get("host") or "").strip()
+    host = parse_host(host_in) if host_in else ""
+    comm = body.get("community")
+    comm = cur["community"] if comm in (None, "") else str(comm)
+    if not re.fullmatch(r"[\x20-\x7e]{1,64}", comm):
+        raise ValueError("Community inválida: use de 1 a 64 caracteres comuns.")
+    try:
+        port = int(body.get("port") or 161)
+    except (TypeError, ValueError):
+        raise ValueError("Porta SNMP inválida.")
+    if not 1 <= port <= 65535:
+        raise ValueError("Porta SNMP inválida.")
+    ifs = body.get("interfaces")
+    if isinstance(ifs, str):
+        ifs = re.split(r"[,;\s]+", ifs.strip())
+    names = list(dict.fromkeys(i.strip() for i in (ifs or []) if i and i.strip())) or list(MIKROTIK_PORTS)
+    if len(names) > 16 or not all(re.fullmatch(r"[A-Za-z0-9_.:/@+-]{1,40}", n) for n in names):
+        raise ValueError("Interfaces inválidas: use nomes como ether1, ether2 (até 16, separados por vírgula).")
+    new = {"host": host, "community": comm, "port": port, "interfaces": names}
+    set_setting("mikrotik", json.dumps(new))
+    mt_reset()
+    return mt_poll(new) if host else ""
+
+
+# ---- leitura e registro das quedas de porta
+def _mt_transition(name, state, oper, last, uptime, since_s, now):
+    """Abre/fecha eventos de queda. O horário vem do próprio roteador (ifLastChange), então é exato."""
+    prev = mt["seen"].get(name)
+    when = now - since_s if since_s is not None and 0 <= since_s < 10 * 365 * 86400 else now
+    when = int(min(when, now))
+    open_ev = q("SELECT id FROM port_events WHERE iface=? AND ended IS NULL", (name,))
+    if state == "down" and not open_ev:
+        x("INSERT INTO port_events (iface, started, reason) VALUES (?,?,?)",
+          (name, when, "Link sem sinal (ifOperStatus=%s)" % _OPER_TEXT.get(oper, oper)))
+        log.warning("PORTA %s caiu (MikroTik %s)", name, mt_config()["host"])
+    elif state != "down" and open_ev:
+        x("UPDATE port_events SET ended=? WHERE iface=? AND ended IS NULL", (when if state == "up" else now, name))
+        log.info("PORTA %s %s", name, "voltou" if state == "up" else "foi desabilitada")
+    elif (prev and prev["state"] == "up" and state == "up" and last is not None and prev["last"] is not None
+          and last != prev["last"] and uptime is not None and prev["uptime"] is not None and uptime >= prev["uptime"]):
+        x("INSERT INTO port_events (iface, started, ended, reason) VALUES (?,?,?,?)",
+          (name, when, when, "Oscilou entre duas leituras (caiu e voltou)"))
+    mt["seen"][name] = {"state": state, "last": last, "uptime": uptime}
+
+
+def _mt_poll(cfg):
+    now, mono = int(time.time()), time.monotonic()
+    names, age = cfg["interfaces"], int(time.time()) - mt["ifmap_at"]
+    missing = [n for n in names if n not in mt["ifmap"]]
+    if not mt["ifmap"] or age > 600 or (missing and age > 60):
+        ifmap = snmp_ifmap(cfg)
+        if not ifmap:
+            raise SnmpError("o roteador respondeu, mas não listou interfaces (IF-MIB).")
+        info = snmp_get(cfg, [_SYS["name"], _SYS["descr"]])
+        with _mt_lock:
+            mt.update(ifmap=ifmap, ifmap_at=now, sysname=str(info.get(_SYS["name"]) or ""),
+                      descr=str(info.get(_SYS["descr"]) or ""))
+    idx = {n: mt["ifmap"].get(n) for n in names}
+    oids = [_SYS["uptime"]] + ["%s.%d" % (o, i) for i in idx.values() if i for o in _IFOIDS.values()]
+    got = snmp_get(cfg, oids)
+    uptime = got.get(_SYS["uptime"])
+    with _mt_lock:
+        for name in names:
+            i = idx[name]
+            if not i:
+                mt["ports"][name] = {"name": name, "found": False, "state": "missing"}
+                continue
+            g = {k: got.get("%s.%d" % (o, i)) for k, o in _IFOIDS.items()}
+            oper, admin = g["oper"], g["admin"]
+            state = "up" if oper == 1 else ("disabled" if admin == 2 else "down")
+            speed = g["hspeed"] or (g["speed"] // 1000000 if g["speed"] and g["speed"] < 4294967295 else 0)
+            wide = g["hin"] is not None
+            in_oct, out_oct = (g["hin"], g["hout"]) if wide else (g["in32"], g["out32"])
+            in_bps = out_bps = None
+            prev = mt["prev"].get(name)
+            if prev and prev[3] != wide:       # o roteador passou a informar outro tipo de contador (32 x 64 bits)
+                prev = None
+            if prev and in_oct is not None and out_oct is not None and mono - prev[0] >= 0.5:  # leituras coladas dão taxa ruidosa
+                dt, span = mono - prev[0], 2 ** (64 if wide else 32)
+                d_in, d_out = in_oct - prev[1], out_oct - prev[2]
+                if d_in < 0 and not wide:      # contador de 32 bits deu a volta
+                    d_in += span
+                if d_out < 0 and not wide:
+                    d_out += span
+                if d_in >= 0 and d_out >= 0:   # negativo em 64 bits = roteador reiniciou: ignora esta leitura
+                    in_bps, out_bps = d_in * 8 / dt, d_out * 8 / dt
+            if not prev or mono - prev[0] >= 0.5:
+                mt["prev"][name] = (mono, in_oct, out_oct, wide)
+            elif name in mt["ports"] and mt["ports"][name].get("in_bps") is not None:
+                in_bps, out_bps = mt["ports"][name]["in_bps"], mt["ports"][name]["out_bps"]   # mantém a última taxa válida
+            if in_bps is not None:
+                mt["samples"].setdefault(name, collections.deque(maxlen=180)).append([now, int(in_bps), int(out_bps)])
+            since_s = (uptime - g["last"]) / 100 if uptime is not None and g["last"] is not None and uptime >= g["last"] else None
+            pct = lambda v: round(min(100.0, v / (speed * 1e6) * 100), 1) if v is not None and speed else None
+            mt["ports"][name] = {"name": name, "found": True, "index": i, "state": state, "admin": admin, "oper": oper,
+                                 "speed": speed, "in_bps": in_bps, "out_bps": out_bps, "in_pct": pct(in_bps),
+                                 "out_pct": pct(out_bps), "in_errors": g["inerr"], "out_errors": g["outerr"],
+                                 "since": int(now - since_s) if since_s is not None else None}
+            _mt_transition(name, state, oper, g["last"], uptime, since_s, now)
+        mt.update(ok=True, error="", last_poll=now, uptime=uptime / 100 if uptime is not None else None)
+
+
+def mt_poll(cfg=None):
+    """Consulta o MikroTik uma vez. Retorna '' se deu certo ou a mensagem de erro."""
+    cfg = cfg or mt_config()
+    if not cfg["host"]:
+        return "MikroTik não configurado."
+    with _poll_lock:
+        try:
+            _mt_poll(cfg)
+            return ""
+        except SnmpError as e:
+            err = str(e)
+        except Exception as e:   # um erro inesperado não pode derrubar a thread de consulta
+            log.exception("erro ao consultar o MikroTik")
+            err = "erro inesperado: %s" % e
+        with _mt_lock:
+            mt.update(ok=False, error=err, last_poll=int(time.time()))
+        return err
+
+
+def mt_snapshot():
+    cfg, t = mt_config(), int(time.time())
+    with _mt_lock:
+        ports = []
+        for n in cfg["interfaces"]:
+            p = dict(mt["ports"].get(n) or {"name": n, "found": None, "state": "unknown"})
+            p["samples"] = list(mt["samples"].get(n, []))
+            ports.append(p)
+        snap = {"configured": bool(cfg["host"]), "host": cfg["host"], "port": cfg["port"], "interfaces": cfg["interfaces"],
+                "has_community": bool(cfg["community"]), "ok": mt["ok"], "error": mt["error"], "last_poll": mt["last_poll"],
+                "interval": SNMP_INTERVAL, "sysname": mt["sysname"], "descr": mt["descr"], "uptime": mt["uptime"], "ports": ports}
+    events = q("SELECT iface, started, ended, reason FROM port_events ORDER BY started DESC, id DESC LIMIT 100")
+    for e in events:
+        e["ongoing"], e["duration"] = e["ended"] is None, (e["ended"] or t) - e["started"]
+    snap["events"] = events
+    return snap
+
+
+def mt_loop():
+    while True:
+        cfg = mt_config()
+        if cfg["host"]:
+            mt_poll(cfg)
+        _mt_wake.wait(SNMP_INTERVAL)
+        _mt_wake.clear()
+
+
 # ------------------------------------ estado --------------------------------
 def build_state():
     t = int(time.time())
     devices = q("""SELECT * FROM devices ORDER BY
                    CASE status WHEN 'offline' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END, name COLLATE NOCASE""")
-    outs = q("""SELECT o.id, o.device_id, d.name, d.host, d.category, o.started, o.ended
+    outs = q("""SELECT o.id, o.device_id, d.name, d.host, d.category, o.started, o.ended, o.start_reason, o.end_reason
                 FROM outages o JOIN devices d ON d.id=o.device_id ORDER BY o.started DESC LIMIT 300""")
     for o in outs:
         o["duration"] = (o["ended"] or t) - o["started"]
@@ -651,7 +1098,7 @@ def build_state():
     counts = {s: sum(1 for d in devices if d["status"] == s) for s in ("online", "offline", "unknown")}
     return {"devices": devices, "outages": outs, "counts": counts, "scan": sc,
             "default_network": DEFAULT_SCAN_NETWORK, "categories": category_names(), "default_category": default_category(), "fails_to_offline": FAILS_TO_OFFLINE,
-            "window_from": win0, "window_to": t, "now": t}
+            "window_from": win0, "window_to": t, "mikrotik": mt_snapshot(), "now": t}
 
 
 # ------------------------------------- HTTP ---------------------------------
@@ -729,6 +1176,12 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     raise ValueError("Ação inválida.")
                 return self.send_json({"ok": True, "count": len(ids)})
+            if method == "POST" and path == "/api/mikrotik/config":
+                err = mt_save(self.read_json())
+                return self.send_json({"ok": not err, "error": err})
+            if method == "POST" and path == "/api/mikrotik/poll":
+                err = mt_poll()
+                return self.send_json({"ok": not err, "error": err})
             if method == "POST" and path == "/api/categories":
                 return self.send_json({"name": add_category(self.read_json().get("name"))}, 201)
             if method == "POST" and path == "/api/categories/rename":
@@ -745,10 +1198,13 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json({"error": "Dispositivo não encontrado."}, 404)
                 cat = parse_category(b.get("category")) if "category" in b else None   # valida tudo antes de gravar
                 name = clean_device_name(b.get("name"), dev[0]["host"]) if "name" in b else None
+                mac = parse_mac_input(b.get("mac")) if "mac" in b else None
                 if cat is not None:
                     x("UPDATE devices SET category=? WHERE id=?", (cat, dev_id))
                 if name is not None:
                     x("UPDATE devices SET name=? WHERE id=?", (name, dev_id))
+                if mac is not None:   # vazio = esquece o MAC (será aprendido de novo no próximo ping)
+                    x("UPDATE devices SET mac=?, vendor=? WHERE id=?", (mac, mac_vendor(mac) if mac else "", dev_id))
                 return self.send_json({"ok": True, "name": name, "category": cat})
             if m and method == "DELETE" and not m.group(2):
                 x("DELETE FROM devices WHERE id=?", (int(m.group(1)),))
@@ -791,7 +1247,7 @@ PAGE = r"""<!doctype html>
     --ink:#15202B; --mute:#5B6B7B; --faint:#8A97A5; --paper:#F1F4F7; --sheet:#FFFFFF; --sheet-2:#F7F9FB; --field:#FFFFFF;
     --line:#E0E6EC; --line-2:#EBEEF2; --up:#0E9F6E; --down:#E03E45; --wait:#B7791F; --dim:#C6CFD8;
     --down-soft:#FDECEC; --wait-soft:#FBF1D9; --up-soft:#DDF3EA; --track:#A6DCC6;
-    --accent:#2350D8; --accent-soft:#E7EDFC; --shadow:0 1px 2px rgba(16,24,40,.06);
+    --accent:#2350D8; --accent-soft:#E7EDFC; --in:#2350D8; --out:#D9822B; --shadow:0 1px 2px rgba(16,24,40,.06);
     --cols:34px 142px minmax(190px,1fr) 116px 76px 190px 156px 108px;
     --sans:"Segoe UI Variable","Segoe UI",system-ui,-apple-system,Roboto,"Helvetica Neue",Arial,sans-serif;
     --mono:ui-monospace,"Cascadia Mono",Consolas,Menlo,monospace;
@@ -800,7 +1256,7 @@ PAGE = r"""<!doctype html>
     --ink:#E6EDF3; --mute:#9AA9B8; --faint:#6F7E8D; --paper:#0F151B; --sheet:#171F27; --sheet-2:#1B2530; --field:#1D2833;
     --line:#293541; --line-2:#222C36; --up:#3CCB8F; --down:#FF6B72; --wait:#E8B04A; --dim:#36434F;
     --down-soft:#3A1E23; --wait-soft:#3A3015; --up-soft:#15392C; --track:#1E6B50;
-    --accent:#7B9BFF; --accent-soft:#1E2B4F; --shadow:none; color-scheme:dark;
+    --accent:#7B9BFF; --accent-soft:#1E2B4F; --in:#7B9BFF; --out:#F0A45D; --shadow:none; color-scheme:dark;
   }
   *{box-sizing:border-box}
   [hidden]{display:none!important}
@@ -896,7 +1352,8 @@ PAGE = r"""<!doctype html>
   .namebtn{display:flex;flex-direction:column;min-width:0;width:100%;background:none;border:0;padding:0;text-align:left;cursor:pointer}
   .nm{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .host{font:12px var(--mono);color:var(--mute);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .compact .namebtn{flex-direction:row;align-items:baseline;gap:12px}
+  .why{font:11.5px var(--mono);color:var(--wait);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%} .st-down .why{color:var(--down)}
+  .compact .namebtn{flex-direction:row;align-items:baseline;gap:12px} .compact .why{flex:1;min-width:0}
   .chip{display:inline-block;max-width:100%;padding:1px 9px;border-radius:999px;background:var(--sheet-2);border:1px solid var(--line);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle}
   .k-lat{font-size:13px;text-align:right} .k-since{font-size:12.5px;color:var(--mute)}
   .k-bar{display:flex;align-items:center;gap:8px}
@@ -914,6 +1371,29 @@ PAGE = r"""<!doctype html>
   .empty strong{display:block;color:var(--ink);font-size:16px;margin-bottom:6px}
   .empty .btn{margin:14px 4px 0}
   .sheet{background:var(--sheet);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);overflow-x:auto}
+
+  /* ---------- MikroTik (portas via SNMP) ---------- */
+  .mt-info{display:flex;gap:26px;flex-wrap:wrap;align-items:center;padding:14px 18px;margin-bottom:14px;overflow:visible}
+  .mt-info .kv small{display:block;font-size:11px;color:var(--faint)} .mt-info .kv b{font-size:15px}
+  .mt-info .pill,.pcard .pill{display:inline-flex;align-items:center;gap:7px;font-weight:600;font-size:13px;white-space:nowrap}
+  .mt-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px;margin-bottom:26px}
+  .pcard{background:var(--sheet);border:1px solid var(--line);border-left:4px solid var(--up);border-radius:12px;padding:16px 18px;box-shadow:var(--shadow)}
+  .pcard.down{border-left-color:var(--down);background:linear-gradient(100deg,var(--down-soft),var(--sheet) 60%)}
+  .pcard.disabled,.pcard.missing,.pcard.unknown{border-left-color:var(--dim)} .pcard.stale{opacity:.6}
+  .phead{display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .phead h3{font:700 19px var(--mono);letter-spacing:-.01em}
+  .pmeta{display:flex;gap:18px;flex-wrap:wrap;margin:6px 0 2px;font-size:12.5px;color:var(--mute)} .pmeta b{color:var(--ink);font-weight:600}
+  .rates{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:14px 0 10px}
+  .rate small{color:var(--mute);font-size:12px} .rate b{display:block;font-size:22px;letter-spacing:-.02em;margin:1px 0 6px}
+  .ubar{height:5px;background:var(--line-2);border-radius:3px;overflow:hidden} .ubar i{display:block;height:100%;border-radius:3px}
+  .spark{width:100%;height:54px;display:block;margin-top:6px;background:var(--sheet-2);border-radius:6px}
+  .spark polyline{fill:none;stroke-width:1.6;vector-effect:non-scaling-stroke;stroke-linejoin:round} .ln-in{stroke:var(--in)} .ln-out{stroke:var(--out)}
+  .spark-note{display:flex;justify-content:space-between;font-size:11.5px;color:var(--faint);margin-top:4px}
+  .spark-note .lg-in::before,.spark-note .lg-out::before{content:"";display:inline-block;width:10px;height:3px;border-radius:2px;margin-right:5px;vertical-align:middle}
+  .lg-in::before{background:var(--in)} .lg-out::before{background:var(--out)} .spark-note span+span{margin-left:12px}
+  .perr{display:flex;gap:18px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line-2);font-size:12.5px;color:var(--mute)} .perr b{color:var(--ink)} .perr b.bad{color:var(--down)}
+  .mt-h{font-size:15px;margin:0 0 10px}
+  .cmd{display:inline-block;text-align:left;margin:16px 0 0;padding:12px 16px;background:var(--sheet-2);border:1px solid var(--line);border-radius:8px;font:12.5px/1.6 var(--mono);color:var(--ink);white-space:pre-wrap}
 
   /* ---------- Ações em massa ---------- */
   .bulk{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);z-index:30;display:flex;gap:10px;align-items:center;flex-wrap:wrap;
@@ -974,6 +1454,7 @@ PAGE = r"""<!doctype html>
   <button role="tab" id="tab-devices" data-tab="devices" aria-controls="p-devices" aria-selected="true">Dispositivos<span class="cnt" id="c-devices" hidden></span></button>
   <button role="tab" id="tab-scan" data-tab="scan" aria-controls="p-scan" aria-selected="false">Varredura de rede<span class="cnt" id="c-scan" hidden></span></button>
   <button role="tab" id="tab-outages" data-tab="outages" aria-controls="p-outages" aria-selected="false">Histórico de quedas<span class="cnt" id="c-outages" hidden></span></button>
+  <button role="tab" id="tab-mikrotik" data-tab="mikrotik" aria-controls="p-mikrotik" aria-selected="false">MikroTik<span class="cnt" id="c-mikrotik" hidden></span></button>
 </nav>
 
 <main>
@@ -1043,6 +1524,9 @@ PAGE = r"""<!doctype html>
     </div>
     <div class="sheet" id="outages"></div>
   </section>
+
+  <!-- ======================= MIKROTIK ======================= -->
+  <section id="p-mikrotik" role="tabpanel" aria-labelledby="tab-mikrotik" hidden><div id="mtbody"></div></section>
 </main>
 
 <div class="bulk" id="bulk" hidden role="region" aria-label="Ações para os itens selecionados">
@@ -1058,6 +1542,7 @@ PAGE = r"""<!doctype html>
   <label>Nome <small>Opcional. Se vazio, usamos o endereço.</small><input id="devname" maxlength="100" autocomplete="off" placeholder="Ex.: Câmera da recepção"></label>
   <label>Endereço <small id="devhost-help">IPv4 ou nome completo (FQDN).</small><input id="devhost" maxlength="253" autocomplete="off" placeholder="192.168.2.1 ou gateway.empresa.com.br" required></label>
   <label>Categoria <select id="devcat"></select></label>
+  <label id="devmacrow" hidden>MAC conhecido <small>Confirma que quem responde é o mesmo equipamento (rede local, Linux). Apague para aprender de novo.</small><input id="devmac" maxlength="17" autocomplete="off" placeholder="aa:bb:cc:dd:ee:ff"></label>
   <p class="form-error" id="deverr" role="alert"></p>
   <div class="dlg-actions">
     <button type="button" class="btn" id="devcancel">Cancelar</button>
@@ -1072,6 +1557,18 @@ PAGE = r"""<!doctype html>
   <div class="sheet" id="catlist"></div>
   <div class="dlg-actions"><button type="button" class="btn" id="catclose">Fechar</button></div>
 </div></dialog>
+
+<dialog id="mtdlg" aria-labelledby="mtdlg-t"><form class="dlg" id="mtform" novalidate>
+  <h3 id="mtdlg-t">Configurar MikroTik (SNMP)</h3>
+  <label>IP do MikroTik <small>Deixe vazio para desativar o monitoramento.</small><input id="mthost" maxlength="253" autocomplete="off" placeholder="192.168.88.1"></label>
+  <div class="dlg-row" style="gap:12px">
+    <label style="flex:1">Community SNMP <small id="mtcomm-help">Somente leitura (v2c).</small><input id="mtcomm" type="password" maxlength="64" autocomplete="new-password" placeholder="public"></label>
+    <label style="width:110px">Porta <small>&nbsp;</small><input id="mtport" inputmode="numeric" maxlength="5" placeholder="161"></label>
+  </div>
+  <label>Interfaces monitoradas <small>Separe por vírgula. Nomes iguais aos do RouterOS.</small><input id="mtifs" maxlength="300" autocomplete="off" placeholder="ether1, ether2, ether5"></label>
+  <p class="form-error" id="mterr" role="alert"></p>
+  <div class="dlg-actions"><button type="button" class="btn" id="mtcancel">Cancelar</button><button class="btn p" id="mtsave">Salvar e testar</button></div>
+</form></dialog>
 
 <div id="msg" hidden role="status"></div>
 
@@ -1165,7 +1662,7 @@ function sinceText(d){
 function detailHTML(d){
   const kv=(k,v)=>`<div><dt>${k}</dt><dd>${v}</dd></div>`;
   return `<div class="detail"><dl>`+kv('Último ping',d.detail?esc(d.detail):'–')+kv('Última verificação',d.last_check?esc(fmt(d.last_check)):'–')+
-    kv('MAC',d.mac?esc(d.mac)+(d.vendor?' ('+esc(d.vendor)+')':''):'–')+kv('Cadastrado em',esc(fmt(d.created)))+
+    kv('MAC conhecido',d.mac?esc(d.mac)+(d.vendor?' ('+esc(d.vendor)+')':''):'–')+kv('Cadastrado em',esc(fmt(d.created)))+
     kv('No estado atual desde',d.since?esc(fmt(d.since)):'–')+`</dl></div>`}
 function rowHTML(d){
   const st=stOf(d), sel=app.sel.has(d.id), open=app.open.has(d.id), n=esc(d.name);
@@ -1173,7 +1670,7 @@ function rowHTML(d){
   return `<div class="item"><div class="row st-${st}${sel?' selected':''}">
     <div class="k-chk"><input type="checkbox" data-sel="${d.id}" ${sel?'checked':''} aria-label="Selecionar ${n}"></div>
     <div class="k-status"><span class="pill ${st}"><i></i>${esc(stLabel(d))}</span></div>
-    <div class="k-name"><button class="namebtn" data-act="expand" aria-expanded="${open}" title="Ver detalhes"><span class="nm">${n}</span><span class="host">${esc(d.host)}</span></button></div>
+    <div class="k-name"><button class="namebtn" data-act="expand" aria-expanded="${open}" title="Ver detalhes"><span class="nm">${n}</span><span class="host">${esc(d.host)}</span>${(st==='down'||st==='wait')&&d.detail?`<span class="why" title="${esc(d.detail)}">${esc(d.detail)}</span>`:''}</button></div>
     <div class="k-cat"><span class="chip">${esc(d.category)}</span></div>
     <div class="k-lat">${lat}</div>
     <div class="k-bar">${trackHTML(d)}<span class="pct">${(Math.floor(d.uptime*10)/10).toFixed(1)}%</span></div>
@@ -1238,16 +1735,18 @@ function renderHeader(){
   const fresh=S.scan.found.filter(x=>!x.registered).length;
   set('#c-devices',S.devices.length||'');
   set('#c-scan',S.scan.running?'varrendo':(fresh?fresh+(fresh===1?' novo':' novos'):''),S.scan.running?'wait':'');
-  set('#c-outages',c.offline?c.offline+' em andamento':'','bad')}
+  set('#c-outages',c.offline?c.offline+' em andamento':'','bad')
+  const m=S.mikrotik, downs=m.ports.filter(p=>p.state==='down').length;
+  set('#c-mikrotik',!m.configured?'':(!m.ok&&m.last_poll)?'sem SNMP':(downs?downs+(downs===1?' porta down':' portas down'):''),(m.ok&&downs)?'bad':'wait')}
 
 /* --------------------------------------------------- histórico de quedas */
 function renderOutages(){
   const q=$('#oq').value.trim().toLowerCase(), only=$('#oopen').checked;
   const rows=S.outages.filter(o=>(!only||!o.ended)&&(!q||`${o.name} ${o.host} ${o.category}`.toLowerCase().includes(q)));
   $('#ocount').textContent=`${rows.length} ${rows.length===1?'registro':'registros'}`+(S.outages.length>=300?' (as 300 mais recentes)':'');
-  $('#outages').innerHTML=rows.length?`<table><thead><tr><th>Dispositivo</th><th>Categoria</th><th>Ficou offline em</th><th>Voltou em</th><th>Duração</th></tr></thead><tbody>`+
-    rows.map(o=>`<tr><td><b>${esc(o.name)}</b><span class="host">${esc(o.host)}</span></td><td><span class="chip">${esc(o.category)}</span></td><td>${esc(fmt(o.started))}</td>
-      <td>${o.ended?esc(fmt(o.ended)):'<span class="tag down">Ainda offline</span>'}</td><td>${dur(o.duration)}${o.ended?'':' e contando'}</td></tr>`).join('')+'</tbody></table>'
+  $('#outages').innerHTML=rows.length?`<table><thead><tr><th>Dispositivo</th><th>Categoria</th><th>Ficou offline em (e motivo)</th><th>Voltou em (e resposta recebida)</th><th>Duração</th></tr></thead><tbody>`+
+    rows.map(o=>`<tr><td><b>${esc(o.name)}</b><span class="host">${esc(o.host)}</span></td><td><span class="chip">${esc(o.category)}</span></td><td>${esc(fmt(o.started))}${o.start_reason?`<span class="detail-l" title="O que o ping mostrou ao cair">${esc(o.start_reason)}</span>`:''}</td>
+      <td>${o.ended?esc(fmt(o.ended)):'<span class="tag down">Ainda offline</span>'}${o.end_reason?`<span class="detail-l" title="Resposta que confirmou o retorno">${esc(o.end_reason)}</span>`:''}</td><td>${dur(o.duration)}${o.ended?'':' e contando'}</td></tr>`).join('')+'</tbody></table>'
     :'<div class="empty"><strong>Nenhuma queda encontrada</strong>Quando um dispositivo parar de responder, o início e o retorno aparecem aqui.</div>'}
 
 /* ----------------------------------------------------------- varredura */
@@ -1300,18 +1799,80 @@ function renderCatList(){
       ?'<span class="tag" title="Recebe os dispositivos de categorias excluídas">padrão</span>'
       :`<button class="link" data-a="catren" data-c="${esc(c)}" type="button">Renomear</button> &nbsp; <button class="link d" data-a="catdel" data-c="${esc(c)}" type="button">Excluir</button>`)+'</td></tr>'}).join('')+'</tbody></table>'}
 
+/* ------------------------------------------------------ MikroTik (SNMP) */
+const fmtRate=b=>{if(b==null) return '–'; const u=['bps','kbps','Mbps','Gbps']; let i=0,v=b; while(v>=1000&&i<3){v/=1000;i++}
+  return (i===0?Math.round(v):v>=100?Math.round(v):v>=10?v.toFixed(1):v.toFixed(2)).toString().replace('.',',')+' '+u[i]};
+const fmtSpeed=m=>!m?'–':m>=1000?(m/1000)+' Gbps':m+' Mbps';
+const fmtInt=n=>n==null?'–':Number(n).toLocaleString('pt-BR');
+const MT_STATE={up:['UP','up'],down:['DOWN','down'],disabled:['Desabilitada','unk'],missing:['Não encontrada','unk'],unknown:['Aguardando leitura','unk']};
+function spark(sm){
+  if(sm.length<2) return '<div class="spark" style="display:grid;place-items:center;color:var(--faint);font-size:12px">coletando amostras…</div>';
+  const W=300,H=54,P=3, max=Math.max(1,...sm.map(s=>Math.max(s[1],s[2])));
+  const x=i=>P+i*(W-2*P)/(sm.length-1), y=v=>H-P-(v/max)*(H-2*P), line=k=>sm.map((s,i)=>x(i).toFixed(1)+','+y(s[k]).toFixed(1)).join(' ');
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Tráfego dos últimos minutos"><polyline class="ln-in" points="${line(1)}"/><polyline class="ln-out" points="${line(2)}"/></svg>
+    <div class="spark-note"><div><span class="lg-in">entrada</span><span class="lg-out">saída</span></div><span>últimos ${dur(sm[sm.length-1][0]-sm[0][0])}, pico ${fmtRate(max)}</span></div>`}
+function portCard(p,ok){
+  const [lbl,cls]=MT_STATE[p.state]||MT_STATE.unknown;
+  let body;
+  if(p.found===false) body=`<p class="mute" style="margin:10px 0 0">Esta interface não existe no roteador. Confira o nome com <code>/interface print</code>.</p>`;
+  else if(p.state==='unknown') body='<p class="mute" style="margin:10px 0 0">Aguardando a primeira leitura…</p>';
+  else{
+    const live=p.state==='up', bar=(v,c)=>`<div class="ubar"><i style="width:${live&&v?v:0}%;background:var(${c})"></i></div>`;
+    body=`<div class="pmeta"><span>Velocidade <b>${fmtSpeed(p.speed)}</b></span>${p.since?`<span>No estado há <b>${dur(S.now-p.since)}</b></span>`:''}</div>
+      <div class="rates"><div class="rate"><small>Entrada (download)</small><b>${live?fmtRate(p.in_bps):'–'}</b>${bar(p.in_pct,'--in')}<small>${live&&p.in_pct!=null?p.in_pct+'% do link':'&nbsp;'}</small></div>
+      <div class="rate"><small>Saída (upload)</small><b>${live?fmtRate(p.out_bps):'–'}</b>${bar(p.out_pct,'--out')}<small>${live&&p.out_pct!=null?p.out_pct+'% do link':'&nbsp;'}</small></div></div>
+      ${spark(p.samples)}
+      <div class="perr"><span>Erros de entrada <b class="${p.in_errors?'bad':''}">${fmtInt(p.in_errors)}</b></span><span>Erros de saída <b class="${p.out_errors?'bad':''}">${fmtInt(p.out_errors)}</b></span></div>`}
+  return `<div class="pcard ${esc(p.state)}${ok?'':' stale'}"><div class="phead"><h3>${esc(p.name)}</h3><span class="pill ${cls}"><i></i>${lbl}</span></div>${body}</div>`}
+function renderMikrotik(){
+  const m=S.mikrotik, box=$('#mtbody');
+  if(!m.configured){
+    box.innerHTML=`<div class="sheet empty"><strong>Monitoramento de portas do MikroTik</strong>
+      Acompanhe ${esc(m.interfaces.join(', '))}: estado do link, velocidade, tráfego e erros, com histórico de quedas, por SNMP.<br>
+      <button class="btn p" data-mt="config" type="button">Configurar MikroTik</button><br>
+      <span class="mute" style="display:inline-block;margin-top:18px;font-size:13px">No RouterOS (Winbox &gt; New Terminal), habilite o SNMP:</span><br>
+      <code class="cmd">/snmp set enabled=yes
+/snmp community set [ find default=yes ] name=public addresses=IP_DO_NETWATCH/32</code></div>`; return}
+  const stale=!m.ok;
+  const info=`<div class="sheet mt-info"><span class="pill ${m.ok?'up':'down'}"><i></i>${m.ok?'SNMP respondendo':'Sem resposta SNMP'}</span>
+    <div class="kv"><small>Roteador</small><b>${esc(m.sysname||m.host)}</b> <span class="host">${esc(m.host)}:${m.port}</span></div>
+    ${m.descr?`<div class="kv" style="min-width:0;max-width:340px"><small>Modelo</small><span class="nm" style="display:block" title="${esc(m.descr)}">${esc(m.descr)}</span></div>`:''}
+    ${m.uptime!=null?`<div class="kv"><small>Ligado há</small><b>${dur(m.uptime)}</b></div>`:''}
+    ${m.last_poll?`<div class="kv"><small>Última leitura</small><b>${new Date(m.last_poll*1000).toLocaleTimeString('pt-BR')}</b></div>`:''}
+    <span class="grow"></span><button class="btn" data-mt="poll" type="button">Atualizar agora</button><button class="btn" data-mt="config" type="button">Configurar</button></div>`;
+  const warn=stale&&m.error?`<div class="sheet note" style="margin-bottom:14px;color:var(--down)">${esc(m.error)}</div>`:'';
+  const ev=m.events.length?`<table><thead><tr><th>Porta</th><th>Caiu em</th><th>Voltou em</th><th>Duração</th><th>Observação</th></tr></thead><tbody>`+
+    m.events.map(e=>`<tr><td><b class="host" style="color:var(--ink);font-size:13px">${esc(e.iface)}</b></td><td>${esc(fmt(e.started))}</td>
+      <td>${e.ongoing?'<span class="tag down">Ainda down</span>':esc(fmt(e.ended))}</td><td>${dur(e.duration)}${e.ongoing?' e contando':''}</td><td class="mute">${esc(e.reason)}</td></tr>`).join('')+'</tbody></table>'
+    :'<div class="empty"><strong>Nenhuma queda de porta registrada</strong>Quando um link cair e voltar, o horário (do próprio roteador) aparece aqui.</div>';
+  box.innerHTML=info+warn+`<div class="mt-grid">${m.ports.map(p=>portCard(p,m.ok)).join('')}</div><h2 class="mt-h">Histórico das portas</h2><div class="sheet">${ev}</div>`}
+$('#mtbody').addEventListener('click',async e=>{const b=e.target.closest('[data-mt]'); if(!b) return;
+  if(b.dataset.mt==='config') openMt();
+  if(b.dataset.mt==='poll'){b.disabled=true; try{const r=await api('/api/mikrotik/poll','POST',{}); r.ok?toast('Leitura atualizada'):toast(r.error,true)}catch(x){toast(x.message,true)} load()}});
+function openMt(){
+  const m=S.mikrotik; $('#mthost').value=m.host||''; $('#mtcomm').value=''; $('#mtport').value=m.port||161; $('#mtifs').value=(m.interfaces||[]).join(', ');
+  $('#mtcomm').placeholder=m.has_community&&m.configured?'•••••• (mantida; digite para trocar)':'public'; $('#mterr').textContent='';
+  $('#mtdlg').showModal(); $('#mthost').focus()}
+$('#mtform').addEventListener('submit',async e=>{e.preventDefault(); const err=$('#mterr'); err.textContent=''; $('#mtsave').disabled=true; $('#mtsave').textContent='Testando…';
+  try{const r=await api('/api/mikrotik/config','POST',{host:$('#mthost').value,community:$('#mtcomm').value,port:$('#mtport').value,interfaces:$('#mtifs').value});
+    if(!r.ok){err.textContent='Configuração salva, mas o roteador não respondeu: '+r.error; load(); return}
+    $('#mtdlg').close(); toast($('#mthost').value.trim()?'MikroTik conectado':'Monitoramento do MikroTik desativado'); load()}
+  catch(x){err.textContent=x.message}
+  finally{$('#mtsave').disabled=false; $('#mtsave').textContent='Salvar e testar'}});
+$('#mtcancel').addEventListener('click',()=>$('#mtdlg').close());
+
 /* -------------------------------------------------------------- render */
 function render(){
-  renderHeader(); renderDevices(); if(app.tab==='outages') renderOutages();
+  renderHeader(); renderDevices(); if(app.tab==='outages') renderOutages(); if(app.tab==='mikrotik') renderMikrotik();
   if($('#catdlg').open) renderCatList(); renderScan()}
 
 function setTab(name){
-  if(!['devices','scan','outages'].includes(name)) name='devices';
+  if(!['devices','scan','outages','mikrotik'].includes(name)) name='devices';
   app.tab=name;
   for(const b of $$('.tabs [data-tab]')){const on=b.dataset.tab===name; b.setAttribute('aria-selected',on); b.tabIndex=on?0:-1}
-  for(const n of ['devices','scan','outages']) $('#p-'+n).hidden=n!==name;
+  for(const n of ['devices','scan','outages','mikrotik']) $('#p-'+n).hidden=n!==name;
   store.set('nw_tab',name); history.replaceState(null,'','#'+name);
-  if(S){ if(name==='outages') renderOutages(); if(name==='scan'){lastScan='';renderScan()} }}
+  if(S){ if(name==='outages') renderOutages(); if(name==='scan'){lastScan='';renderScan()} if(name==='mikrotik') renderMikrotik() }}
 
 async function load(){
   clearTimeout(timer);
@@ -1330,6 +1891,7 @@ function openDev(dev){
   $('#devname').value=dev?dev.name:''; $('#devhost').value=dev?dev.host:''; $('#devhost').readOnly=!!dev;
   $('#devhost-help').textContent=dev?'Não pode ser alterado. Para trocar, exclua e cadastre de novo.':'IPv4 ou nome completo (FQDN).';
   $('#devcat').value=dev?dev.category:(app.cat||S.default_category);
+  $('#devmacrow').hidden=!dev; $('#devmac').value=dev?dev.mac:'';
   $('#deverr').textContent=''; $('#devdlg').showModal(); (dev?$('#devname'):$('#devhost')).focus()}
 async function saveDev(keepOpen){
   const err=$('#deverr'); err.textContent='';
@@ -1337,7 +1899,7 @@ async function saveDev(keepOpen){
   if(!host){err.textContent='Informe um IP ou nome (FQDN).'; $('#devhost').focus(); return}
   $('#devsave').disabled=$('#devmore').disabled=true;
   try{
-    if(app.editing){await api('/api/devices/'+app.editing,'PATCH',{name,category}); toast('Alterações salvas')}
+    if(app.editing){await api('/api/devices/'+app.editing,'PATCH',{name,category,mac:$('#devmac').value.trim()}); toast('Alterações salvas')}
     else{await api('/api/devices','POST',{name,host,category}); toast('Dispositivo adicionado')}
     if(keepOpen&&!app.editing){$('#devname').value='';$('#devhost').value='';$('#devhost').focus()} else $('#devdlg').close();
     load()}
@@ -1457,9 +2019,38 @@ def render_page():
     return PAGE.replace("<!--LOGO-->", logo).replace("<!--FAVICON-->", fav)
 
 
+_lock_file = None
+
+
+def acquire_instance_lock():
+    """Impede duas cópias do NetWatch usando o mesmo banco: uma delas, mais antiga, poderia sobrescrever o status."""
+    global _lock_file
+    f = open(DB_FILE + ".lock", "a+")
+    try:
+        f.seek(0)
+        if WIN:
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return False
+    f.seek(0)
+    f.truncate()
+    f.write(str(os.getpid()))
+    f.flush()
+    _lock_file = f
+    return True
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s")
+    if not acquire_instance_lock():
+        sys.exit("Já existe outro NetWatch usando este banco (%s). Feche-o antes (ex.: ps aux | grep netwatch)." % DB_FILE)
     threading.Thread(target=monitor_loop, daemon=True).start()
+    threading.Thread(target=mt_loop, daemon=True).start()
     srv = ThreadingHTTPServer((BIND, PORT), Handler)
     srv.daemon_threads = True
     log.info("NetWatch rodando em http://localhost:%d", PORT)
